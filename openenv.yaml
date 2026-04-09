@@ -1,0 +1,63 @@
+name: workflow-automation-env
+version: 1.0.0
+description: >
+  OpenEnv environment where an AI agent learns to decompose natural-language
+  workflow descriptions into structured automation plans. Models real-world
+  DevOps/ops automation (trigger → steps → edges → error handling).
+
+author: Darshan Linge Gowda
+tags:
+  - openenv
+  - workflow-automation
+  - devops
+  - real-world
+
+tasks:
+  - id: easy
+    description: >
+      Linear 2-step: Google Sheets row added → read row → send Gmail.
+      Tests trigger identification and basic data-flow mapping.
+    difficulty: easy
+
+  - id: medium
+    description: >
+      Conditional branch: GitHub issue opened → if label=critical then
+      create Jira + post Slack; else add GitHub label.
+    difficulty: medium
+
+  - id: hard
+    description: >
+      Multi-step DAG: daily cron → Postgres query → Python transform →
+      BigQuery insert (parallel) + Slack digest.
+      Error branch: Postgres failure → PagerDuty alert (severity=critical).
+    difficulty: hard
+
+action_space:
+  type: object
+  description: >
+    WorkflowAction with trigger, trigger_config, condition, error_branch,
+    steps (array of WorkflowStep), edges (array of WorkflowEdge).
+
+observation_space:
+  type: object
+  description: >
+    WorkflowObservation with task_description, task_id, step_count,
+    last_score (0-1), feedback, done.
+
+reward_range: [0.0, 1.0]
+
+env_vars:
+  - name: API_BASE_URL
+    description: The API endpoint for the LLM.
+    required: true
+  - name: MODEL_NAME
+    description: The model identifier to use for inference.
+    required: true
+  - name: HF_TOKEN
+    description: Your Hugging Face / API key.
+    required: true
+
+endpoints:
+  reset: POST /reset
+  step:  POST /step
+  state: GET  /state

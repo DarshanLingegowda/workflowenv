@@ -1,0 +1,20 @@
+# FINAL VERSION FIX
+[project]
+name = "workflowenv"
+version = "0.1.0"
+requires-python = ">=3.10,<3.13"
+
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "httpx",
+    "openenv-core>=0.2.0"
+]
+
+[project.scripts]
+server = "server.app:main"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
