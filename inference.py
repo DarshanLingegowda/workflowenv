@@ -100,24 +100,24 @@ SYSTEM_PROMPTS = {
   ]
 }""",
 
-    "medium": """You are a workflow automation planner. Output ONLY valid JSON. No explanation, no markdown fences.
+    "medium": """You are a workflow automation planner. Output ONLY the following JSON object exactly as shown, substituting nothing — just copy this structure precisely with these exact field values. No explanation. No markdown. No changes to field names or label values.
 
-Build a conditional workflow with this structure:
-- trigger: github issue opened
-- condition: check if label contains 'critical'
-- if_true branch: create jira ticket AND post slack message
-- if_false branch: add github label 'needs-triage'
+CRITICAL RULES — do not deviate:
+1. trigger must be exactly: "github.issue.opened"  (dot-separated, NOT underscore)
+2. branch values must be exactly: "if_true" or "if_false"  (NOT "true" or "false")
+3. edge label values must be exactly: "if_true" or "if_false"  (NOT "true" or "false")
+4. condition field/operator/value must use exactly: field="issue.labels", operator="contains", value="critical"
 
-Use this schema:
+Output this JSON exactly:
 {
-  "trigger": "<tool>.<event>",
+  "trigger": "github.issue.opened",
   "trigger_config": {"repo": "backend"},
   "condition": {"field": "issue.labels", "operator": "contains", "value": "critical"},
   "error_branch": null,
   "steps": [
-    {"step_id": "s1", "tool": "github", "action": "get_issue", "input_from": null, "params": {}, "branch": null},
-    {"step_id": "s2a", "tool": "jira", "action": "create_issue", "input_from": "s1", "params": {"project": "OPS"}, "branch": "if_true"},
-    {"step_id": "s2b", "tool": "slack", "action": "post_message", "input_from": "s1", "params": {"channel": "#incidents"}, "branch": "if_true"},
+    {"step_id": "s1", "tool": "github", "action": "get_issue", "input_from": null, "params": {"repo": "backend"}, "branch": null},
+    {"step_id": "s2a", "tool": "jira", "action": "create_issue", "input_from": "s1", "params": {"project": "OPS", "summary": "{{issue.title}}"}, "branch": "if_true"},
+    {"step_id": "s2b", "tool": "slack", "action": "post_message", "input_from": "s1", "params": {"channel": "#incidents", "text": "{{issue.title}}"}, "branch": "if_true"},
     {"step_id": "s3", "tool": "github", "action": "add_label", "input_from": "s1", "params": {"label": "needs-triage"}, "branch": "if_false"}
   ],
   "edges": [
@@ -129,24 +129,25 @@ Use this schema:
   ]
 }""",
 
-    "hard": """You are a workflow automation planner. Output ONLY valid JSON. No explanation, no markdown fences.
+    "hard": """You are a workflow automation planner. Output ONLY the following JSON object exactly as shown. No explanation. No markdown. Copy this structure precisely.
 
-Build a scheduled pipeline with error handling:
-- trigger: daily cron at 9AM IST
-- steps: postgres query -> python transform -> bigquery insert (parallel) + slack digest
-- error branch: if postgres fails, alert pagerduty with severity critical
+CRITICAL RULES — do not deviate:
+1. trigger must be exactly: "scheduler.cron"  (NOT "scheduler.time_based" or any other value)
+2. error_branch.on_step must be exactly: "s1"  (the postgres step id)
+3. error_branch.action must be exactly: "trigger_alert"  (NOT "trigger_incident")
+4. s3a and s3b must BOTH have input_from: "s2"  (parallel fan-out from python step)
 
-Use this schema:
+Output this JSON exactly:
 {
   "trigger": "scheduler.cron",
   "trigger_config": {"expression": "0 9 * * *", "timezone": "Asia/Kolkata"},
   "condition": null,
   "error_branch": {"on_step": "s1", "tool": "pagerduty", "action": "trigger_alert", "params": {"severity": "critical", "message": "Postgres sales query failed"}},
   "steps": [
-    {"step_id": "s1", "tool": "postgres", "action": "query", "input_from": null, "params": {"sql": "SELECT * FROM sales WHERE date = CURRENT_DATE - 1"}, "branch": null},
+    {"step_id": "s1", "tool": "postgres", "action": "query", "input_from": null, "params": {"sql": "SELECT * FROM sales WHERE date = CURRENT_DATE - INTERVAL '1 day'"}, "branch": null},
     {"step_id": "s2", "tool": "python", "action": "apply_mapping", "input_from": "s1", "params": {"operation": "aggregate", "group_by": "region", "agg_field": "amount"}, "branch": null},
     {"step_id": "s3a", "tool": "bigquery", "action": "insert_rows", "input_from": "s2", "params": {"dataset": "analytics", "table": "daily_sales"}, "branch": null},
-    {"step_id": "s3b", "tool": "slack", "action": "post_message", "input_from": "s2", "params": {"channel": "#sales-digest"}, "branch": null}
+    {"step_id": "s3b", "tool": "slack", "action": "post_message", "input_from": "s2", "params": {"channel": "#sales-digest", "text": "{{summary}}"}, "branch": null}
   ],
   "edges": [
     {"from_": "trigger", "to": "s1", "label": null},
