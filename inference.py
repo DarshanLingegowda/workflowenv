@@ -168,20 +168,26 @@ def log_start(task: str, env: str, model: str) -> None:
 
 
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    # Reward must be strictly between 0 and 1 (not 0.0, not 1.0)
+    safe_reward = max(0.01, min(0.99, reward)) if reward > 0 else 0.01
+    safe_reward = reward  # keep raw for step, clamp only in log_end score
     error_val = error if error else "null"
     done_val  = str(done).lower()
-    # action must be single line
     action_clean = str(action).replace("\n", " ").replace("\r", "")
+    safe_r = max(0.01, min(0.99, reward))
     print(
-        f"[STEP] step={step} action={action_clean} reward={reward:.2f} done={done_val} error={error_val}",
+        f"[STEP] step={step} action={action_clean} reward={safe_r:.2f} done={done_val} error={error_val}",
         flush=True,
     )
 
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    # Scores must be strictly between 0 and 1 (not 0.0, not 1.0)
+    safe_score = max(0.01, min(0.99, score))
+    safe_rewards = [max(0.01, min(0.99, r)) for r in rewards]
+    rewards_str = ",".join(f"{r:.2f}" for r in safe_rewards)
     print(
-        f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}",
+        f"[END] success={str(success).lower()} steps={steps} score={safe_score:.2f} rewards={rewards_str}",
         flush=True,
     )
 
