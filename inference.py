@@ -201,10 +201,6 @@ def build_client() -> OpenAI:
 
 def call_llm(client: OpenAI, task_id: str, verbose: bool = False) -> str:
     model = MODEL_NAME or "Qwen/Qwen2.5-72B-Instruct"
-    # Auto-append :auto provider if no provider suffix given
-    model_id = model.split("/")[-1] if "/" in model else model
-    if ":" not in model_id:
-        model = model + ":auto"
 
     if verbose:
         print(f"[DEBUG] Calling {model} for task={task_id}", file=sys.stderr, flush=True)
