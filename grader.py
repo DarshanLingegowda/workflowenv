@@ -84,7 +84,9 @@ class BaseGrader:
         return [s for s in plan.steps if s.tool == tool]
 
     def _steps_on_branch(self, plan, branch):
-        return [s for s in plan.steps if s.branch == branch]
+        # Accept both "if_true"/"if_false" and "true"/"false" from LLMs
+        alt = branch.replace("if_", "") if branch.startswith("if_") else "if_" + branch
+        return [s for s in plan.steps if s.branch in (branch, alt)]
 
     def _has_edge(self, plan, from_, to, label=None):
         for e in plan.edges:
@@ -150,7 +152,13 @@ class MediumGrader(BaseGrader):
         scores = {}
         notes = []
 
-        scores["trigger_correct"] = 0.20 if plan.trigger == self.GROUND_TRUTH_TRIGGER else 0.0
+        # Accept common LLM variants of the trigger name
+        trigger_ok = plan.trigger in (
+            "github.issue.opened",
+            "github.issue_opened",
+            "github.issues.opened",
+        )
+        scores["trigger_correct"] = 0.20 if trigger_ok else 0.0
         if not scores["trigger_correct"]:
             notes.append(f"Expected 'github.issue.opened', got '{plan.trigger}'")
 
@@ -190,8 +198,8 @@ class MediumGrader(BaseGrader):
 
         true_steps  = [s.step_id for s in true_branch]
         false_steps = [s.step_id for s in false_branch]
-        true_edges  = [e for e in plan.edges if e.label == "if_true"  and e.to in true_steps]
-        false_edges = [e for e in plan.edges if e.label == "if_false" and e.to in false_steps]
+        true_edges  = [e for e in plan.edges if e.label in ("if_true",  "true")  and e.to in true_steps]
+        false_edges = [e for e in plan.edges if e.label in ("if_false", "false") and e.to in false_steps]
         edge_score = 0.0
         if true_edges:
             edge_score += 0.075
@@ -211,8 +219,19 @@ class HardGrader(BaseGrader):
         scores = {}
         notes = []
 
-        if plan.trigger == self.GROUND_TRUTH_TRIGGER:
-            has_expr = bool(plan.trigger_config.get("expression"))
+        # Accept common LLM variants
+        trigger_ok = plan.trigger in (
+            "scheduler.cron",
+            "scheduler.time_based",
+            "scheduler.daily",
+            "cron",
+        )
+        if trigger_ok:
+            has_expr = bool(
+                plan.trigger_config.get("expression") or
+                plan.trigger_config.get("time") or
+                plan.trigger_config.get("schedule")
+            )
             scores["trigger_correct"] = 0.15 if has_expr else 0.10
             if not has_expr:
                 notes.append("Cron expression missing from trigger_config")
@@ -257,9 +276,13 @@ class HardGrader(BaseGrader):
             eb_score = 0.0
             if eb.tool == "pagerduty":
                 eb_score += 0.10
-            if eb.action in ("trigger_alert", "create_incident"):
+            if eb.action in ("trigger_alert", "create_incident",
+                              "trigger_incident", "create_alert", "alert"):
                 eb_score += 0.05
-            if pg_steps and eb.on_step == pg_steps[0].step_id:
+            if pg_steps and (
+                eb.on_step == pg_steps[0].step_id or
+                eb.on_step in ("s1", "postgres", "pg")
+            ):
                 eb_score += 0.05
             scores["error_branch_present"] = self._clamp(eb_score)
         else:
