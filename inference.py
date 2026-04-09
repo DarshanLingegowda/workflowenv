@@ -340,14 +340,12 @@ def run_task(
         rewards.append(reward)
         steps_taken = 1
 
-        # Compact single-line action log
+        # Simple action log - no JSON, just readable summary
         try:
-            action_log = json.dumps({
-                "trigger": plan.trigger,
-                "steps":   [s.step_id for s in plan.steps],
-            })
+            step_ids = ",".join(s.step_id for s in plan.steps)
+            action_log = f"trigger={plan.trigger} steps=[{step_ids}]"
         except Exception:
-            action_log = (raw or "")[:200]
+            action_log = "parse_failed"
 
         log_step(step=1, action=action_log, reward=reward, done=done, error=error)
 
