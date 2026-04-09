@@ -190,19 +190,13 @@ def log_step(
 def log_end(
     *,
     success: bool,
-    steps:   int,
-    score:   float,
+    steps: int,
     rewards: list[float],
 ) -> None:
-    """[END] success=<true|false> steps=<n> score=<0.00> rewards=<r1,r2,...>"""
+    """[END] success=<true|false> steps=<n> rewards=<r1,r2,...>"""
     success_str = "true" if success else "false"
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(
-        f"[END]   success={success_str} steps={steps} "
-        f"score={score:.2f} rewards={rewards_str}",
-        flush=True,
-    )
-
+    print(f"[END] success={success_str} steps={steps} rewards={rewards_str}", flush=True)
 
 # ---------------------------------------------------------------------------
 # LLM client
