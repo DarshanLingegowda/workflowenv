@@ -317,4 +317,4 @@ class WorkflowGrader:
         return grader.grade(plan)
 
     def grade_all(self, plans):
-        return {tid: self.grade(tid, plan) for tid, plan in plans.items()}
+        return {tid: self.grade(tid, plan) for tid, plan in plans.items()}  
