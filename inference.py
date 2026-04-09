@@ -1,39 +1,22 @@
 """
+inference.py - WorkflowEnv
 ==========================
+STDOUT FORMAT (must match exactly - evaluator parses these lines):
 
     [START] task=<task_name> env=<benchmark> model=<model_name>
-    [STEP]step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
-    [END]uccess=<true|false> steps=<n> rewards=<r1,r2,...>
+    [STEP] step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END] success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
 
-Rules (from sample inference script):
-  - One [START] line at episode begin.
-  - One [STEP] line per step, immediately after env.step() returns.
-  - One [END] line always emitted (even on exception).
-  - reward and rewards formatted to 2 decimal places.
-  - done and success are lowercase: true or false.
-  - error is raw error string, or null if none.
-  - All fields on a single line, no newlines within a line.
-
-Required env vars:
-    API_BASE_URL   The API endpoint for the LLM.
-    MODEL_NAME     The model identifier to use for inference.
-    HF_TOKEN       Your Hugging Face / API key.
-
-Usage:
-    python inference.py
-    python inference.py --task easy
-    python inference.py --verbose
+Required env vars: API_BASE_URL, MODEL_NAME, HF_TOKEN
 """
 
-from __future__ import annotations
-
-import argparse
+import asyncio
 import json
 import os
 import sys
 import time
 import traceback
-from typing import Optional
+from typing import List, Optional
 
 from openai import OpenAI
 
@@ -43,45 +26,36 @@ try:
     _GRADER_CLS  = WorkflowGraderV2
     _EASY_PROMPT = EASY_TASK_PROMPT
 except ImportError:
-    from grader import WorkflowGrader as _GRADER_CLS  # type: ignore
+    from grader import WorkflowGrader as _GRADER_CLS
     _EASY_PROMPT = None
 
-from grader import (
-    WorkflowPlan,
-    WorkflowStep,
-    WorkflowCondition,
-    ErrorBranch,
-    Edge,
-)
-
+from grader import WorkflowPlan, WorkflowStep, WorkflowCondition, ErrorBranch, Edge
 
 # ---------------------------------------------------------------------------
+# Config — mirroring official sample pattern exactly
 # ---------------------------------------------------------------------------
+API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME   = os.getenv("MODEL_NAME")   or "Qwen/Qwen2.5-72B-Instruct"
 
-API_BASE_URL = os.getenv("API_BASE_URL", "<your-active-endpoint>")
-MODEL_NAME   = os.getenv("MODEL_NAME",   "<your-active-model>")
-HF_TOKEN     = os.getenv("HF_TOKEN",     "")
-
-MAX_TOKENS        = 1500
-TEMPERATURE       = 0.2
-REQUEST_SLEEP     = 1.0
+BENCHMARK         = "WorkflowEnv"
+TASK_NAMES        = ["easy", "medium", "hard"]
+MAX_STEPS         = 1       # WorkflowEnv is single-turn
 SUCCESS_THRESHOLD = 0.75
-
-BENCHMARK  = "WorkflowEnv"
-TASK_NAMES = ["easy", "medium", "hard"]
-
+TEMPERATURE       = 0.2
+MAX_TOKENS        = 1500
+REQUEST_SLEEP     = 1.0
 
 # ---------------------------------------------------------------------------
 # Task prompts
 # ---------------------------------------------------------------------------
-
-TASKS: dict[str, str] = {
+TASKS = {
     "easy": _EASY_PROMPT or (
         "When a new row is added to a Google Sheet named 'Lead Tracker' "
         "(columns: id, name, email, company, source), send an email via Gmail "
         "to sales-team@company.com. Subject: 'New lead: {{name}}'. "
         "Body: all row data. Step 1 reads the row; Step 2 sends the email "
-        "with input_from pointing to Step 1's step_id. Build the workflow."
+        "with input_from pointing to Step 1 step_id. Build the workflow."
     ),
     "medium": (
         "When a GitHub issue is opened in the 'backend' repository: "
@@ -95,10 +69,9 @@ TASKS: dict[str, str] = {
         "Postgres table named 'sales' (columns: id, product, amount, region). "
         "Transform the data using a Python script to calculate total sales per region. "
         "Write the aggregated results to a BigQuery table named 'analytics.daily_sales'. "
-        "In parallel, post a digest message to the #sales-digest Slack channel "
-        "summarising the totals. "
-        "If the Postgres query fails for any reason, trigger a PagerDuty alert "
-        "with severity 'critical'. Build the full workflow."
+        "In parallel, post a digest message to the #sales-digest Slack channel. "
+        "If the Postgres query fails, trigger a PagerDuty alert with severity 'critical'. "
+        "Build the full workflow."
     ),
 }
 
@@ -107,143 +80,158 @@ SUPPORTED_TOOLS = [
     "jira", "postgres", "bigquery", "python",
     "scheduler", "pagerduty", "webhook", "http",
 ]
-SYSTEM_PROMPT = f"""You are a workflow automation expert.
 
-Return ONLY valid JSON.
+# Per-task system prompts with correct example JSON for each task
+SYSTEM_PROMPTS = {
+    "easy": """You are a workflow automation planner. Output ONLY valid JSON matching this schema exactly. No explanation, no markdown fences.
 
-{{
+{
   "trigger": "google_sheets.row_added",
-  "trigger_config": {{
-    "sheet_name": "Lead Tracker"
-  }},
+  "trigger_config": {"sheet_name": "Lead Tracker"},
   "condition": null,
   "error_branch": null,
   "steps": [
-    {{
-      "step_id": "s1",
-      "tool": "google_sheets",
-      "action": "get_row",
-      "input_from": null,
-      "params": {{
-        "sheet_name": "Lead Tracker"
-      }},
-      "branch": null
-    }},
-    {{
-      "step_id": "s2",
-      "tool": "gmail",
-      "action": "send_email",
-      "input_from": "s1",
-      "params": {{
-        "to": "sales-team@company.com",
-        "subject": "New lead: {{name}}",
-        "body": "{{row}}"
-      }},
-      "branch": null
-    }}
+    {"step_id": "s1", "tool": "google_sheets", "action": "get_row", "input_from": null, "params": {"sheet_name": "Lead Tracker"}, "branch": null},
+    {"step_id": "s2", "tool": "gmail", "action": "send_email", "input_from": "s1", "params": {"to": "sales-team@company.com", "subject": "New lead: {{name}}", "body": "{{row}}"}, "branch": null}
   ],
   "edges": [
-    {{
-      "from_": "trigger",
-      "to": "s1",
-      "label": null
-    }},
-    {{
-      "from_": "s1",
-      "to": "s2",
-      "label": null
-    }}
+    {"from_": "trigger", "to": "s1", "label": null},
+    {"from_": "s1", "to": "s2", "label": null}
   ]
-}}
+}""",
 
-Supported tools: {', '.join(SUPPORTED_TOOLS)}
-"""
+    "medium": """You are a workflow automation planner. Output ONLY valid JSON. No explanation, no markdown fences.
+
+Build a conditional workflow with this structure:
+- trigger: github issue opened
+- condition: check if label contains 'critical'
+- if_true branch: create jira ticket AND post slack message
+- if_false branch: add github label 'needs-triage'
+
+Use this schema:
+{
+  "trigger": "<tool>.<event>",
+  "trigger_config": {"repo": "backend"},
+  "condition": {"field": "issue.labels", "operator": "contains", "value": "critical"},
+  "error_branch": null,
+  "steps": [
+    {"step_id": "s1", "tool": "github", "action": "get_issue", "input_from": null, "params": {}, "branch": null},
+    {"step_id": "s2a", "tool": "jira", "action": "create_issue", "input_from": "s1", "params": {"project": "OPS"}, "branch": "if_true"},
+    {"step_id": "s2b", "tool": "slack", "action": "post_message", "input_from": "s1", "params": {"channel": "#incidents"}, "branch": "if_true"},
+    {"step_id": "s3", "tool": "github", "action": "add_label", "input_from": "s1", "params": {"label": "needs-triage"}, "branch": "if_false"}
+  ],
+  "edges": [
+    {"from_": "trigger", "to": "s1", "label": null},
+    {"from_": "s1", "to": "condition", "label": null},
+    {"from_": "condition", "to": "s2a", "label": "if_true"},
+    {"from_": "condition", "to": "s2b", "label": "if_true"},
+    {"from_": "condition", "to": "s3", "label": "if_false"}
+  ]
+}""",
+
+    "hard": """You are a workflow automation planner. Output ONLY valid JSON. No explanation, no markdown fences.
+
+Build a scheduled pipeline with error handling:
+- trigger: daily cron at 9AM IST
+- steps: postgres query -> python transform -> bigquery insert (parallel) + slack digest
+- error branch: if postgres fails, alert pagerduty with severity critical
+
+Use this schema:
+{
+  "trigger": "scheduler.cron",
+  "trigger_config": {"expression": "0 9 * * *", "timezone": "Asia/Kolkata"},
+  "condition": null,
+  "error_branch": {"on_step": "s1", "tool": "pagerduty", "action": "trigger_alert", "params": {"severity": "critical", "message": "Postgres sales query failed"}},
+  "steps": [
+    {"step_id": "s1", "tool": "postgres", "action": "query", "input_from": null, "params": {"sql": "SELECT * FROM sales WHERE date = CURRENT_DATE - 1"}, "branch": null},
+    {"step_id": "s2", "tool": "python", "action": "apply_mapping", "input_from": "s1", "params": {"operation": "aggregate", "group_by": "region", "agg_field": "amount"}, "branch": null},
+    {"step_id": "s3a", "tool": "bigquery", "action": "insert_rows", "input_from": "s2", "params": {"dataset": "analytics", "table": "daily_sales"}, "branch": null},
+    {"step_id": "s3b", "tool": "slack", "action": "post_message", "input_from": "s2", "params": {"channel": "#sales-digest"}, "branch": null}
+  ],
+  "edges": [
+    {"from_": "trigger", "to": "s1", "label": null},
+    {"from_": "s1", "to": "s2", "label": null},
+    {"from_": "s2", "to": "s3a", "label": null},
+    {"from_": "s2", "to": "s3b", "label": null},
+    {"from_": "s1", "to": "error_branch", "label": "on_error"}
+  ]
+}""",
+}
+
 # ---------------------------------------------------------------------------
-# Mandatory structured stdout logging
-# Plain text, NOT JSON. Do not change field names or order.
+# Mandatory stdout logging — copied from official sample pattern exactly
 # ---------------------------------------------------------------------------
 
-def log_start(*, task: str, env: str, model: str) -> None:
-    """[START] task=<name> env=<benchmark> model=<model>"""
+def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
-def log_step(
-    *,
-    step:   int,
-    action: str,
-    reward: float,
-    done:   bool,
-    error:  Optional[str],
-) -> None:
-    """[STEP] step=<n> action=<str> reward=<0.00> done=<true|false> error=<msg|null>"""
-    done_str   = "true" if done else "false"
-    error_str  = error if error is not None else "null"
-    action_str = action.replace("\n", " ").replace("\r", "")
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val  = str(done).lower()
+    # action must be single line
+    action_clean = str(action).replace("\n", " ").replace("\r", "")
     print(
-        f"[STEP]  step={step} action={action_str} "
-        f"reward={reward:.2f} done={done_str} error={error_str}",
+        f"[STEP] step={step} action={action_clean} reward={reward:.2f} done={done_val} error={error_val}",
         flush=True,
     )
 
 
-def log_end(
-    *,
-    success: bool,
-    steps: int,
-    rewards: list[float],
-) -> None:
-    """[END] success=<true|false> steps=<n> rewards=<r1,r2,...>"""
-    success_str = "true" if success else "false"
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(f"[END] success={success_str} steps={steps} rewards={rewards_str}", flush=True)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}",
+        flush=True,
+    )
 
 # ---------------------------------------------------------------------------
 # LLM client
 # ---------------------------------------------------------------------------
 
 def build_client() -> OpenAI:
-    missing = [name for name, val in [
-        ("API_BASE_URL", API_BASE_URL),
-        ("MODEL_NAME",   MODEL_NAME),
-        ("HF_TOKEN",     HF_TOKEN),
-    ] if not val or val.startswith("<")]
-    if missing:
-        print(
-            f"[ERROR] Missing or unconfigured env vars: {', '.join(missing)}",
-            file=sys.stderr,
-        )
+    if not API_KEY:
+        print("[ERROR] HF_TOKEN is not set", file=sys.stderr)
         sys.exit(1)
-    return OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+    base = (API_BASE_URL or "https://router.huggingface.co/v1").rstrip("/")
+    if not base.endswith("/v1"):
+        base = base + "/v1"
+    return OpenAI(base_url=base, api_key=API_KEY)
 
 
-def call_llm(client: OpenAI, prompt: str, verbose: bool = False) -> str:
+def call_llm(client: OpenAI, task_id: str, verbose: bool = False) -> str:
+    model = MODEL_NAME or "Qwen/Qwen2.5-72B-Instruct"
+    # Auto-append :auto provider if no provider suffix given
+    model_id = model.split("/")[-1] if "/" in model else model
+    if ":" not in model_id:
+        model = model + ":auto"
+
     if verbose:
-        print(f"[DEBUG] Calling model={MODEL_NAME} ...", file=sys.stderr, flush=True)
+        print(f"[DEBUG] Calling {model} for task={task_id}", file=sys.stderr, flush=True)
 
-    resp = client.chat.completions.create(
-        model=MODEL_NAME,
-        max_tokens=MAX_TOKENS,
-        temperature=TEMPERATURE,
-        stream=False,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt},
-        ],
-    )
-    raw = (resp.choices[0].message.content or "").strip()
-    if verbose:
-        print(f"[DEBUG] LLM raw ({len(raw)} chars):\n{raw}\n",
-              file=sys.stderr, flush=True)
-    return raw
-
+    try:
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPTS[task_id]},
+                {"role": "user",   "content": TASKS[task_id]},
+            ],
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            stream=False,
+        )
+        text = (completion.choices[0].message.content or "").strip()
+        return text if text else "{}"
+    except Exception as exc:
+        print(f"[DEBUG] Model request failed: {exc}", file=sys.stderr, flush=True)
+        raise
 
 # ---------------------------------------------------------------------------
+# Parser
 # ---------------------------------------------------------------------------
 
 def parse_plan(raw: str) -> WorkflowPlan:
     text = raw.strip()
-    # Strip accidental markdown fences
+    # Strip markdown fences if present
     if text.startswith("```"):
         parts = text.split("```")
         text = parts[1] if len(parts) > 1 else text
@@ -304,41 +292,38 @@ def parse_plan(raw: str) -> WorkflowPlan:
         error_branch   = error_branch,
     )
 
-
 # ---------------------------------------------------------------------------
-# Single-task runner
+# Single-task runner — mirrors official sample structure
 # ---------------------------------------------------------------------------
 
 def run_task(
-    client: OpenAI,
+    client:      OpenAI,
     grader,
-    task_id: str,
-    max_retries: int = 1,
-    verbose: bool = False,
-) -> float:
-    """
-    Run one WorkflowEnv task (single-turn: agent submits one plan).
-    Returns score in [0.0, 1.0].
-    """
-    rewards: list[float] = []
-    steps_taken: int = 0
-    score: float = 0.0
-    success: bool = False
-    error_msg: Optional[str] = None
+    task_id:     str,
+    max_retries: int  = 1,
+    verbose:     bool = False,
+) -> None:
+    rewards:     List[float] = []
+    steps_taken: int         = 0
+    score:       float       = 0.0
+    success:     bool        = False
 
-    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME or "")
 
     try:
-        raw = None
-        plan = None
+        raw   = None
+        plan  = None
+        error = None
 
+        # Attempt LLM call — retry on any failure
         for attempt in range(1, max_retries + 2):
             try:
-                raw = call_llm(client, TASKS[task_id], verbose=verbose)
+                raw  = call_llm(client, task_id, verbose=verbose)
                 plan = parse_plan(raw)
+                error = None
                 break
             except Exception as exc:
-                error_msg = f"LLM error attempt {attempt}: {exc}"
+                error = f"attempt {attempt}: {exc}"
                 if verbose:
                     traceback.print_exc(file=sys.stderr)
                 time.sleep(REQUEST_SLEEP)
@@ -346,44 +331,38 @@ def run_task(
         if plan is None:
             plan = WorkflowPlan(trigger="", steps=[], edges=[])
 
+        # Grade the plan (single step)
         result = grader.grade(task_id, plan)
         reward = round(result.total, 2)
-        done = True
+        done   = True
 
         rewards.append(reward)
         steps_taken = 1
 
+        # Compact single-line action log
         try:
-            action_log = json.dumps(
-                {
-                    "trigger": plan.trigger,
-                    "steps": [s.step_id for s in plan.steps],
-                }
-            )
+            action_log = json.dumps({
+                "trigger": plan.trigger,
+                "steps":   [s.step_id for s in plan.steps],
+            })
         except Exception:
-            action_log = raw[:200] if raw else "{}"
+            action_log = (raw or "")[:200]
 
-        log_step(
-            step=1,
-            action=action_log,
-            reward=reward,
-            done=done,
-            error=error_msg,
-        )
+        log_step(step=1, action=action_log, reward=reward, done=done, error=error)
 
-        score = min(max(reward, 0.0), 1.0)
+        score   = min(max(reward, 0.0), 1.0)
         success = score >= SUCCESS_THRESHOLD
 
     except Exception as exc:
-        error_msg = str(exc)
+        error = str(exc)
         if verbose:
             traceback.print_exc(file=sys.stderr)
-        log_step(step=1, action="", reward=0.00, done=True, error=error_msg)
-        score = 0.0
+        log_step(step=1, action="", reward=0.0, done=True, error=error)
+        score   = 0.0
         success = False
 
     finally:
-        log_end(success=success, steps=steps_taken, rewards=rewards)
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
     return score
 
@@ -392,45 +371,39 @@ def run_task(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    import argparse
     parser = argparse.ArgumentParser(description="WorkflowEnv inference")
-    parser.add_argument(
-        "--task", choices=TASK_NAMES, default=None,
-        help="Run a single task instead of all three",
-    )
-    parser.add_argument(
-        "--max-retries", type=int, default=1,
-        help="Extra LLM retries on JSON parse failure (default: 1)",
-    )
-    parser.add_argument(
-        "--verbose", "-v", action="store_true",
-        help="Print LLM output and debug info to stderr",
-    )
+    parser.add_argument("--task", choices=TASK_NAMES, default=None,
+                        help="Run a single task instead of all three")
+    parser.add_argument("--max-retries", type=int, default=1,
+                        help="Extra retries on LLM failure (default: 1)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Print LLM output and debug info to stderr")
     args = parser.parse_args()
 
     task_ids = [args.task] if args.task else TASK_NAMES
 
     client = build_client()
     grader = _GRADER_CLS()
-
-    all_scores: dict[str, float] = {}
+    all_scores = {}
 
     for i, task_id in enumerate(task_ids):
-        score = run_task(
-            client, grader, task_id,
-            max_retries=args.max_retries,
-            verbose=args.verbose,
-        )
-        all_scores[task_id] = score
+        sc = run_task(client, grader, task_id,
+                      max_retries=args.max_retries,
+                      verbose=args.verbose)
+        all_scores[task_id] = sc
         if i < len(task_ids) - 1:
             time.sleep(REQUEST_SLEEP)
 
+    # Human-readable summary to stderr only (stdout must stay clean)
+    print("\n-- WorkflowEnv results --", file=sys.stderr)
     for tid, sc in all_scores.items():
+        bar    = "#" * round(sc * 20) + "." * (20 - round(sc * 20))
         status = "PASS" if sc >= SUCCESS_THRESHOLD else "FAIL"
-        print(f"  {tid:<8}  [{status}]  {sc:.2f}  ", file=sys.stderr)
-        avg = sum(all_scores.values()) / len(all_scores) if all_scores else 0.0
-        passed = sum(1 for s in all_scores.values() if s >= SUCCESS_THRESHOLD)
-        print(f"\n  Average : {avg:.2f}  |  Passed: {passed}/{len(all_scores)}",
-          file=sys.stderr)
+        print(f"  {tid:<8} [{status}] {sc:.2f} {bar}", file=sys.stderr)
+    avg    = sum(all_scores.values()) / len(all_scores) if all_scores else 0.0
+    passed = sum(1 for s in all_scores.values() if s >= SUCCESS_THRESHOLD)
+    print(f"\n  Average: {avg:.2f} | Passed: {passed}/{len(all_scores)}", file=sys.stderr)
 
     sys.exit(1 if any(s < SUCCESS_THRESHOLD for s in all_scores.values()) else 0)
 
